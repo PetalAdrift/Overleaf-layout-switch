@@ -1,0 +1,244 @@
+(() => {
+  'use strict';
+
+  const BUTTON_ID = 'ol-swap-layout-btn';
+  const STATE = {
+    active: false,
+    // Each entry: { node, parent, next }
+    originalPlacements: [],
+    // Helps us avoid duplicate work on rerenders
+    lastAppliedAt: 0
+  };
+
+  /** Utility: safe query */
+  const $ = (sel, root = document) => root.querySelector(sel);
+
+  /** Find the "outer" horizontal panel group containing rail + sidebar + main area. */
+  function findOuterGroup() {
+    // This is the element with display:flex; flex-direction:row for the whole workspace.
+    // We avoid data-panel-group-id because it’s unstable.
+    return $('.ide-redesign-inner[data-panel-group][data-panel-group-direction="horizontal"]');
+  }
+
+  /** Find the current sidebar panel (file-tree / search / etc.) */
+  function findSidebarPanel() {
+    // Overleaf uses ids like: ide-redesign-sidebar-panel-file-tree, etc.
+    // Pick the first matching panel node.
+    const panels = [...document.querySelectorAll('div[id^="ide-redesign-sidebar-panel-"][data-panel]')];
+    if (!panels.length) return null;
+
+    // Prefer one that is not display:none and has nonzero client rect.
+    const visible = panels.find(p => {
+      const cs = getComputedStyle(p);
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && p.getClientRects().length > 0;
+    });
+
+    return visible || panels[0];
+  }
+
+  /** Find the separator that collapses/resizes the sidebar (controls sidebar panel). */
+  function findSidebarSeparator(sidebarPanel) {
+    if (!sidebarPanel?.id) return null;
+    return document.querySelector(`div[role="separator"][aria-controls="${CSS.escape(sidebarPanel.id)}"]`);
+  }
+
+  /** Find editor section */
+  function findEditorPanel() {
+    // In your snippet, the editor is: section#ide-redesign-editor-panel[aria-label="Editor"]
+    return $('section[aria-label="Editor"]#ide-redesign-editor-panel') || $('section[aria-label="Editor"]');
+  }
+
+  /** Find pdf section */
+  function findPdfPanel() {
+    return $('section[aria-label="PDF preview"]#ide-redesign-pdf-panel') || $('section[aria-label="PDF preview"]');
+  }
+
+  /** Find the separator between editor and PDF (contains toggler + synctex controls). */
+  function findEditorPdfSeparator() {
+    // This is the separator that has synctex controls in your snippet.
+    // Use a strong clue: it contains .synctex-controls, and role=separator.
+    return document.querySelector('div[role="separator"] .synctex-controls')?.closest('div[role="separator"]')
+      || document.querySelector('div[role="separator"][aria-controls="ide-redesign-editor-panel"]');
+  }
+
+  /** Save original placement of a node (parent + next sibling) for restoration. */
+  function rememberPlacement(node) {
+    STATE.originalPlacements.push({
+      node,
+      parent: node.parentNode,
+      next: node.nextSibling
+    });
+  }
+
+  /** Restore all moved nodes to their original places. */
+  function restoreOriginalLayout() {
+    // Restore in reverse order to reduce sibling/DOM surprises.
+    for (let i = STATE.originalPlacements.length - 1; i >= 0; i--) {
+      const { node, parent, next } = STATE.originalPlacements[i];
+      if (!node || !parent) continue;
+      if (next && next.parentNode === parent) parent.insertBefore(node, next);
+      else parent.appendChild(node);
+    }
+    STATE.originalPlacements = [];
+  }
+
+  /** Apply the swapped layout: PDF | Editor | Sidebar */
+  function applySwappedLayout() {
+    const outer = findOuterGroup();
+    if (!outer) return false;
+
+    const rail = $('nav.ide-rail[aria-label="Sidebar"]', outer) || $('nav.ide-rail', outer);
+    const sidebar = findSidebarPanel();
+    const sidebarSep = findSidebarSeparator(sidebar);
+    const editor = findEditorPanel();
+    const pdf = findPdfPanel();
+    const editorPdfSep = findEditorPdfSeparator();
+
+    if (!rail || !sidebar || !sidebarSep || !editor || !pdf || !editorPdfSep) return false;
+
+    // We also want the sidebar to remain "next to editor" (on the right).
+    // We'll insert after the rail in the exact order:
+    // PDF, editor/pdf separator, Editor, sidebar separator, Sidebar.
+    //
+    // Before moving, record original placements so we can restore later.
+    STATE.originalPlacements = [];
+    [pdf, editorPdfSep, editor, sidebarSep, sidebar].forEach(rememberPlacement);
+
+    const insertAfter = rail.nextSibling; // insert right after rail
+    // Insert in order, always before the same "anchor" (the original next sibling after rail)
+    // so we preserve the rest of the UI.
+    outer.insertBefore(pdf, insertAfter);
+    outer.insertBefore(editorPdfSep, insertAfter);
+    outer.insertBefore(editor, insertAfter);
+    outer.insertBefore(sidebarSep, insertAfter);
+    outer.insertBefore(sidebar, insertAfter);
+
+    // Optional: hide the now-empty wrapper panel (often #ide-redesign-editor-and-pdf-panel)
+    // so it doesn't consume flex space if it becomes empty.
+    const wrapper = $('#ide-redesign-editor-and-pdf-panel');
+    if (wrapper && wrapper.getClientRects().length > 0) {
+      // Only hide if it no longer contains the editor/pdf panels.
+      if (!wrapper.contains(editor) && !wrapper.contains(pdf)) {
+        wrapper.dataset.olSwapHidden = 'true';
+        wrapper.style.display = 'none';
+      }
+    }
+
+    return true;
+  }
+
+  /** Undo any wrapper hiding we did. */
+  function unhideWrapperIfNeeded() {
+    const wrapper = $('#ide-redesign-editor-and-pdf-panel');
+    if (wrapper?.dataset?.olSwapHidden === 'true') {
+      wrapper.style.display = '';
+      delete wrapper.dataset.olSwapHidden;
+    }
+  }
+
+  /** Toggle handler */
+  function toggleLayout() {
+    if (!STATE.active) {
+      const ok = applySwappedLayout();
+      if (ok) STATE.active = true;
+    } else {
+      unhideWrapperIfNeeded();
+      restoreOriginalLayout();
+      STATE.active = false;
+    }
+    updateButtonState();
+  }
+
+  /** Inject the toolbar button near the existing layout/share controls. */
+  function ensureButton() {
+    const actions = $('.ide-redesign-toolbar-actions');
+    if (!actions) return false;
+
+    if ($('#' + BUTTON_ID)) return true;
+
+    const container = document.createElement('div');
+    container.className = 'ide-redesign-toolbar-button-container';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = BUTTON_ID;
+    btn.className =
+      'd-inline-grid ide-redesign-toolbar-button-subdued ide-redesign-toolbar-button-icon icon-button btn btn-primary';
+    btn.setAttribute('aria-label', 'Swap PDF / Editor / Sidebar');
+    btn.title = 'Swap layout: PDF | Editor | Sidebar';
+    btn.innerHTML = `
+      <span class="button-content" aria-hidden="false">
+        <span class="material-symbols icon-small" aria-hidden="true" translate="no">swap_horiz</span>
+      </span>
+    `;
+    btn.addEventListener('click', toggleLayout, { passive: true });
+
+    container.appendChild(btn);
+
+    // Insert after the existing Layout dropdown button if possible, else append.
+    const layoutBtn = $('#layout-dropdown-btn');
+    const layoutContainer = layoutBtn?.closest('.ide-redesign-toolbar-button-container');
+    if (layoutContainer && layoutContainer.parentNode === actions) {
+      actions.insertBefore(container, layoutContainer.nextSibling);
+    } else {
+      actions.appendChild(container);
+    }
+
+    updateButtonState();
+    return true;
+  }
+
+  function updateButtonState() {
+    const btn = $('#' + BUTTON_ID);
+    if (!btn) return;
+    btn.setAttribute('aria-pressed', STATE.active ? 'true' : 'false');
+    btn.style.opacity = STATE.active ? '1.0' : '';
+  }
+
+  /** Overleaf rerenders; keep the button alive and (optionally) reapply when active. */
+  function startObserver() {
+    const obs = new MutationObserver(() => {
+      // Throttle: Overleaf can spam mutations.
+      const now = Date.now();
+      if (now - STATE.lastAppliedAt < 250) return;
+      STATE.lastAppliedAt = now;
+
+      ensureButton();
+
+      // If active, and our panels got moved back by a rerender, try to reapply.
+      if (STATE.active) {
+        const outer = findOuterGroup();
+        const sidebar = findSidebarPanel();
+        const editor = findEditorPanel();
+        const pdf = findPdfPanel();
+        if (outer && sidebar && editor && pdf) {
+          // Check if order is still PDF -> Editor -> Sidebar (after rail).
+          const rail = $('nav.ide-rail', outer);
+          if (rail) {
+            const kids = [...outer.children];
+            const iRail = kids.indexOf(rail);
+            const seq = kids.slice(iRail + 1);
+            const iPdf = seq.indexOf(pdf);
+            const iEditor = seq.indexOf(editor);
+            const iSidebar = seq.indexOf(sidebar);
+            const isOk = iPdf !== -1 && iEditor !== -1 && iSidebar !== -1 && iPdf < iEditor && iEditor < iSidebar;
+            if (!isOk) {
+              // Best-effort reapply. If it fails, we just leave it.
+              try {
+                // Clear placements to avoid restoring to stale nodes
+                STATE.originalPlacements = [];
+                applySwappedLayout();
+              } catch {}
+            }
+          }
+        }
+      }
+    });
+
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  // Boot
+  ensureButton();
+  startObserver();
+})();
